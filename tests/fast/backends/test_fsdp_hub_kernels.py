@@ -29,7 +29,7 @@ from miles.backends.fsdp_utils.kernels.presets import (
 )
 
 
-def make_args(**overrides) -> Namespace:
+def _make_args(**overrides) -> Namespace:
     base = dict(
         kernel_backend="hub",
         kernel_mapping_path="",
@@ -49,7 +49,7 @@ def clear_kernel_cache():
     hub._RESOLVED.clear()
 
 
-def stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=None):
+def _stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=None):
     """Install a fake `kernels` package.
 
     `module` serves every repo; `modules` maps repo_id -> module so a test can make one repo
@@ -72,23 +72,23 @@ def stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=N
     monkeypatch.setitem(sys.modules, "kernels", fake)
 
 
-def kernel_module(**functions):
+def _kernel_module(**functions):
     mod = types.ModuleType("fake_hub_kernel")
     for name, fn in functions.items():
         setattr(mod, name, fn)
     return mod
 
 
-def noop(*args, **kwargs):
+def _noop(*args, **kwargs):
     return None
 
 
-def all_hub_modules(**overrides):
+def _all_hub_modules(**overrides):
     """One stub module per repo in the shipped mapping, with every advertised function present."""
     modules = {
-        "kernels-community/fla": kernel_module(chunk_gated_delta_rule=noop, fused_recurrent_gated_delta_rule=noop),
-        "kernels-community/causal-conv1d": kernel_module(causal_conv1d_fn=noop, causal_conv1d_update=noop),
-        "kernels-community/flash-attn2": kernel_module(flash_attn_varlen_func=noop),
+        "kernels-community/fla": _kernel_module(chunk_gated_delta_rule=_noop, fused_recurrent_gated_delta_rule=_noop),
+        "kernels-community/causal-conv1d": _kernel_module(causal_conv1d_fn=_noop, causal_conv1d_update=_noop),
+        "kernels-community/flash-attn2": _kernel_module(flash_attn_varlen_func=_noop),
     }
     modules.update(overrides)
     return modules
@@ -98,7 +98,7 @@ def all_hub_modules(**overrides):
 
 
 def test_native_is_the_default_and_stays_inert(monkeypatch):
-    args = make_args(kernel_backend="native")
+    args = _make_args(kernel_backend="native")
     monkeypatch.delitem(sys.modules, "kernels", raising=False)
 
     assert hub_kernels_enabled(args) is False
@@ -111,18 +111,18 @@ def test_native_is_the_default_and_stays_inert(monkeypatch):
 @pytest.mark.parametrize("mode", ["true_on_policy_mode", "deterministic_mode"])
 def test_hub_backend_is_rejected_in_the_bit_exact_modes(mode):
     with pytest.raises(ValueError, match="incompatible with --true-on-policy-mode"):
-        validate_kernel_backend_args(make_args(**{mode: True}))
+        validate_kernel_backend_args(_make_args(**{mode: True}))
 
 
 @pytest.mark.parametrize("mode", ["true_on_policy_mode", "deterministic_mode"])
 def test_default_mapping_is_empty_in_the_bit_exact_modes(mode):
     """Defence in depth: even if validation is bypassed, the preset hands back nothing to bind."""
-    assert load_module_kernels(make_args(**{mode: True})) == {}
+    assert load_module_kernels(_make_args(**{mode: True})) == {}
 
 
 def test_unknown_backend_is_rejected():
     with pytest.raises(ValueError, match="--kernel-backend must be one of"):
-        validate_kernel_backend_args(make_args(kernel_backend="hubb"))
+        validate_kernel_backend_args(_make_args(kernel_backend="hubb"))
 
 
 @pytest.mark.parametrize(
@@ -134,19 +134,19 @@ def test_unknown_backend_is_rejected():
 )
 def test_hub_only_flags_are_rejected_under_native(overrides, message):
     with pytest.raises(ValueError, match=message):
-        validate_kernel_backend_args(make_args(kernel_backend="native", **overrides))
+        validate_kernel_backend_args(_make_args(kernel_backend="native", **overrides))
 
 
 def test_native_and_hub_both_validate_clean():
-    validate_kernel_backend_args(make_args(kernel_backend="native"))
-    validate_kernel_backend_args(make_args(kernel_backend="hub", kernel_strict=True))
+    validate_kernel_backend_args(_make_args(kernel_backend="native"))
+    validate_kernel_backend_args(_make_args(kernel_backend="hub", kernel_strict=True))
 
 
 # ------------------------------------------------------------------------------------ presets
 
 
 def test_default_mapping_pins_the_expected_repos():
-    mapping = load_module_kernels(make_args())
+    mapping = load_module_kernels(_make_args())
 
     assert set(mapping) == {SLOT_GATED_DELTA_RULE, SLOT_CAUSAL_CONV1D, SLOT_FLASH_ATTN_VARLEN}
     assert (mapping[SLOT_GATED_DELTA_RULE].repo_id, mapping[SLOT_GATED_DELTA_RULE].version) == (
@@ -170,18 +170,18 @@ def test_default_mapping_pins_the_expected_repos():
     assert "flash_attn_varlen_func" in mapping[SLOT_FLASH_ATTN_VARLEN].functions
 
 
-def custom_mapping(args):
+def _custom_mapping(args):
     return {
         SLOT_CAUSAL_CONV1D: HubKernelSpec(repo_id="me/my-conv1d", revision="main", functions=("causal_conv1d_fn",))
     }
 
 
-def broken_mapping(args):
+def _broken_mapping(args):
     return {SLOT_CAUSAL_CONV1D: "kernels-community/causal-conv1d"}
 
 
 def test_kernel_mapping_path_substitutes_the_whole_mapping():
-    args = make_args(kernel_mapping_path=f"{__name__}.custom_mapping")
+    args = _make_args(kernel_mapping_path=f"{__name__}._custom_mapping")
     mapping = load_module_kernels(args)
 
     assert set(mapping) == {SLOT_CAUSAL_CONV1D}
@@ -189,7 +189,7 @@ def test_kernel_mapping_path_substitutes_the_whole_mapping():
 
 
 def test_kernel_mapping_path_rejects_a_non_spec_value():
-    args = make_args(kernel_mapping_path=f"{__name__}.broken_mapping")
+    args = _make_args(kernel_mapping_path=f"{__name__}._broken_mapping")
     with pytest.raises(TypeError, match="must be a HubKernelSpec"):
         load_module_kernels(args)
 
@@ -206,12 +206,12 @@ def test_spec_rejects_both_pins_and_no_functions():
 
 def test_resolve_slot_passes_the_pin_through_and_caches_the_module(monkeypatch):
     calls = []
-    stub_kernels(
+    _stub_kernels(
         monkeypatch,
-        module=kernel_module(causal_conv1d_fn=lambda **kw: None, causal_conv1d_update=lambda: None),
+        module=_kernel_module(causal_conv1d_fn=lambda **kw: None, causal_conv1d_update=lambda: None),
         calls=calls,
     )
-    args = make_args()
+    args = _make_args()
 
     first = resolve_slot(args, SLOT_CAUSAL_CONV1D)
     second = resolve_slot(args, SLOT_CAUSAL_CONV1D)
@@ -223,24 +223,24 @@ def test_resolve_slot_passes_the_pin_through_and_caches_the_module(monkeypatch):
 
 
 def test_unresolvable_repo_falls_back_to_the_native_kernel(monkeypatch, caplog):
-    stub_kernels(monkeypatch, raises=FileNotFoundError("no build for torch2.9-cu130"))
+    _stub_kernels(monkeypatch, raises=FileNotFoundError("no build for torch2.9-cu130"))
 
     with caplog.at_level("WARNING"):
-        assert resolve_slot(make_args(), SLOT_CAUSAL_CONV1D) is None
+        assert resolve_slot(_make_args(), SLOT_CAUSAL_CONV1D) is None
     assert "keeping the native kernel" in caplog.text
 
 
 def test_unresolvable_repo_raises_under_strict(monkeypatch):
-    stub_kernels(monkeypatch, raises=FileNotFoundError("no build for torch2.9-cu130"))
+    _stub_kernels(monkeypatch, raises=FileNotFoundError("no build for torch2.9-cu130"))
 
     with pytest.raises(RuntimeError, match="--kernel-strict"):
-        resolve_slot(make_args(kernel_strict=True), SLOT_CAUSAL_CONV1D)
+        resolve_slot(_make_args(kernel_strict=True), SLOT_CAUSAL_CONV1D)
 
 
 def test_a_failed_repo_is_not_retried_per_model(monkeypatch):
     calls = []
-    stub_kernels(monkeypatch, raises=FileNotFoundError("nope"), calls=calls)
-    args = make_args()
+    _stub_kernels(monkeypatch, raises=FileNotFoundError("nope"), calls=calls)
+    args = _make_args()
 
     assert resolve_slot(args, SLOT_CAUSAL_CONV1D) is None
     assert resolve_slot(args, SLOT_CAUSAL_CONV1D) is None
@@ -248,29 +248,29 @@ def test_a_failed_repo_is_not_retried_per_model(monkeypatch):
 
 
 def test_a_build_missing_the_function_falls_back(monkeypatch, caplog):
-    stub_kernels(monkeypatch, module=kernel_module(causal_conv1d_fn=lambda: None))  # no causal_conv1d_update
+    _stub_kernels(monkeypatch, module=_kernel_module(causal_conv1d_fn=lambda: None))  # no causal_conv1d_update
 
     with caplog.at_level("WARNING"):
-        assert resolve_slot(make_args(), SLOT_CAUSAL_CONV1D) is None
+        assert resolve_slot(_make_args(), SLOT_CAUSAL_CONV1D) is None
     assert "does not expose a callable" in caplog.text
 
     with pytest.raises(RuntimeError, match="does not expose a callable"):
-        resolve_slot(make_args(kernel_strict=True), SLOT_CAUSAL_CONV1D)
+        resolve_slot(_make_args(kernel_strict=True), SLOT_CAUSAL_CONV1D)
 
 
 def test_prefetch_is_inert_under_native(monkeypatch):
     calls = []
-    stub_kernels(monkeypatch, module=kernel_module(), calls=calls)
+    _stub_kernels(monkeypatch, module=_kernel_module(), calls=calls)
 
-    hub.prefetch_hub_module_kernels(make_args(kernel_backend="native"))
+    hub.prefetch_hub_module_kernels(_make_args(kernel_backend="native"))
 
     assert calls == []
 
 
 def test_prefetch_warms_every_mapped_repo_once(monkeypatch):
     calls = []
-    stub_kernels(monkeypatch, modules=all_hub_modules(), calls=calls)
-    args = make_args()
+    _stub_kernels(monkeypatch, modules=_all_hub_modules(), calls=calls)
+    args = _make_args()
 
     hub.prefetch_hub_module_kernels(args)
     for slot in (SLOT_GATED_DELTA_RULE, SLOT_CAUSAL_CONV1D, SLOT_FLASH_ATTN_VARLEN):
@@ -299,8 +299,8 @@ class FakeGatedDeltaNet(nn.Module):
         super().__init__()
         self.causal_conv1d_fn = native_conv
         self.causal_conv1d_update = None
-        self.chunk_gated_delta_rule = native_chunk or torch_chunk_stand_in
-        self.recurrent_gated_delta_rule = native_chunk or torch_chunk_stand_in
+        self.chunk_gated_delta_rule = native_chunk or _torch_chunk_stand_in
+        self.recurrent_gated_delta_rule = native_chunk or _torch_chunk_stand_in
 
     def forward(self, x):
         self.chunk_gated_delta_rule(x, g=None, beta=None, cu_seqlens=None)
@@ -310,22 +310,22 @@ class FakeGatedDeltaNet(nn.Module):
         return self.causal_conv1d_fn(x=x, weight=None, bias=None, activation="silu", seq_idx=None)
 
 
-def torch_chunk_stand_in(query, g=None, beta=None, **kwargs):
+def _torch_chunk_stand_in(query, g=None, beta=None, **kwargs):
     """transformers' pure-torch GDN fallback: swallows cu_seqlens and never resets per document."""
     return query
 
 
-def build_gdn_model(native_conv=None, native_chunk=None, n_layers=2):
+def _build_gdn_model(native_conv=None, native_chunk=None, n_layers=2):
     model = nn.Module()
     model.layers = nn.ModuleList([FakeGatedDeltaNet(native_conv, native_chunk) for _ in range(n_layers)])
     return model
 
 
 def test_binder_rebinds_every_gated_deltanet(monkeypatch):
-    stub_kernels(monkeypatch, modules=all_hub_modules())
-    model = build_gdn_model()
+    _stub_kernels(monkeypatch, modules=_all_hub_modules())
+    model = _build_gdn_model()
 
-    assert apply_hub_module_kernels(model, make_args()) == {"gated_deltanet": 2}
+    assert apply_hub_module_kernels(model, _make_args()) == {"gated_deltanet": 2}
     fla = sys.modules["kernels"].get_kernel("kernels-community/fla")
     conv = sys.modules["kernels"].get_kernel("kernels-community/causal-conv1d")
     for layer in model.layers:
@@ -338,34 +338,36 @@ def test_binder_rebinds_every_gated_deltanet(monkeypatch):
 
 def test_gated_deltanet_slots_resolve_independently(monkeypatch):
     """One Hub repo being unavailable must not cost the run the other slot."""
-    modules = all_hub_modules()
+    modules = _all_hub_modules()
     del modules["kernels-community/causal-conv1d"]
-    stub_kernels(monkeypatch, modules=modules)
-    model = build_gdn_model(native_conv=None)
+    _stub_kernels(monkeypatch, modules=modules)
+    model = _build_gdn_model(native_conv=None)
 
-    assert apply_hub_module_kernels(model, make_args()) == {"gated_deltanet": 2}
+    assert apply_hub_module_kernels(model, _make_args()) == {"gated_deltanet": 2}
     fla = sys.modules["kernels"].get_kernel("kernels-community/fla")
     assert model.layers[0].chunk_gated_delta_rule is fla.chunk_gated_delta_rule
     assert model.layers[0].causal_conv1d_fn is None  # untouched: no build to bind
 
 
 def test_binder_is_inert_under_native(monkeypatch):
-    stub_kernels(monkeypatch, modules=all_hub_modules())
-    model = build_gdn_model(native_conv=None)
+    _stub_kernels(monkeypatch, modules=_all_hub_modules())
+    model = _build_gdn_model(native_conv=None)
 
-    assert apply_hub_module_kernels(model, make_args(kernel_backend="native")) == {}
+    assert apply_hub_module_kernels(model, _make_args(kernel_backend="native")) == {}
     assert model.layers[0].causal_conv1d_fn is None
-    assert model.layers[0].chunk_gated_delta_rule is torch_chunk_stand_in
+    assert model.layers[0].chunk_gated_delta_rule is _torch_chunk_stand_in
 
 
 def test_binder_leaves_the_native_kernels_when_every_hub_repo_fails(monkeypatch):
-    native = lambda **kw: None  # noqa: E731
-    stub_kernels(monkeypatch, raises=FileNotFoundError("nope"))
-    model = build_gdn_model(native_conv=native)
+    def native(**kwargs):
+        return None
 
-    assert apply_hub_module_kernels(model, make_args()) == {}
+    _stub_kernels(monkeypatch, raises=FileNotFoundError("nope"))
+    model = _build_gdn_model(native_conv=native)
+
+    assert apply_hub_module_kernels(model, _make_args()) == {}
     assert model.layers[0].causal_conv1d_fn is native
-    assert model.layers[0].chunk_gated_delta_rule is torch_chunk_stand_in
+    assert model.layers[0].chunk_gated_delta_rule is _torch_chunk_stand_in
 
 
 def test_hub_kernels_still_receive_the_packed_document_boundaries(monkeypatch):
@@ -388,14 +390,16 @@ def test_hub_kernels_still_receive_the_packed_document_boundaries(monkeypatch):
         seen["seq_idx"] = kwargs.get("seq_idx")
         return kwargs["x"]
 
-    stub_kernels(
+    _stub_kernels(
         monkeypatch,
-        modules=all_hub_modules(
+        modules=_all_hub_modules(
             **{
-                "kernels-community/fla": kernel_module(
-                    chunk_gated_delta_rule=hub_chunk, fused_recurrent_gated_delta_rule=noop
+                "kernels-community/fla": _kernel_module(
+                    chunk_gated_delta_rule=hub_chunk, fused_recurrent_gated_delta_rule=_noop
                 ),
-                "kernels-community/causal-conv1d": kernel_module(causal_conv1d_fn=hub_conv, causal_conv1d_update=noop),
+                "kernels-community/causal-conv1d": _kernel_module(
+                    causal_conv1d_fn=hub_conv, causal_conv1d_update=_noop
+                ),
             }
         ),
     )
@@ -406,7 +410,7 @@ def test_hub_kernels_still_receive_the_packed_document_boundaries(monkeypatch):
 
     model = nn.Module()
     model.layers = nn.ModuleList([gdn_cls()])
-    assert apply_hub_module_kernels(model, make_args()) == {"gated_deltanet": 1}
+    assert apply_hub_module_kernels(model, _make_args()) == {"gated_deltanet": 1}
 
     layer = model.layers[0]
     cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
@@ -440,27 +444,29 @@ class FakeAttnBlock(nn.Module):
 def test_binder_stashes_varlen_on_each_nemotron_attention_mixer(monkeypatch):
     from miles.backends.fsdp_utils.models.nemotron_h import HUB_VARLEN_ATTR
 
-    varlen = lambda *a, **kw: None  # noqa: E731
-    stub_kernels(monkeypatch, module=kernel_module(flash_attn_varlen_func=varlen))
+    def varlen(*args, **kwargs):
+        return None
+
+    _stub_kernels(monkeypatch, module=_kernel_module(flash_attn_varlen_func=varlen))
 
     model = nn.Module()
     model.blocks = nn.ModuleList([FakeAttnBlock() for _ in range(3)])
 
-    assert apply_hub_module_kernels(model, make_args()) == {"nemotron_h": 3}
+    assert apply_hub_module_kernels(model, _make_args()) == {"nemotron_h": 3}
     for block in model.blocks:
         assert getattr(block.mixer, HUB_VARLEN_ATTR) is varlen
 
 
 def test_binders_skip_architectures_that_are_not_present(monkeypatch):
-    stub_kernels(
+    _stub_kernels(
         monkeypatch,
-        module=kernel_module(
+        module=_kernel_module(
             causal_conv1d_fn=lambda: None, causal_conv1d_update=lambda: None, flash_attn_varlen_func=lambda: None
         ),
     )
     plain = nn.Sequential(nn.Linear(4, 4))
 
-    assert apply_hub_module_kernels(plain, make_args()) == {}
+    assert apply_hub_module_kernels(plain, _make_args()) == {}
 
 
 class FakeNemotronAttn(nn.Module):
@@ -480,7 +486,7 @@ class FakeNemotronAttn(nn.Module):
         return hidden_states, None
 
 
-def patch_nemotron_attn(monkeypatch, native_varlen):
+def _patch_nemotron_attn(monkeypatch, native_varlen):
     """Install `_patch_attn_forward` on a fresh class with `flash_attn` stubbed to `native_varlen`."""
     from miles.backends.fsdp_utils.models import nemotron_h as nemotron_h_module
 
@@ -493,7 +499,7 @@ def patch_nemotron_attn(monkeypatch, native_varlen):
     return cls
 
 
-def run_packed_forward(mixer):
+def _run_packed_forward(mixer):
     mixer._packing_cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
     mixer._packing_max_seqlen = 2
     return mixer(torch.zeros(1, 4, 8))
@@ -502,10 +508,13 @@ def run_packed_forward(mixer):
 def test_nemotron_attention_still_uses_the_native_varlen_kernel(monkeypatch):
     """The Hub handle is an override, not a replacement: with no --kernel-backend hub the wheel wins."""
     used = []
-    native = lambda *a, **kw: (used.append("native") or torch.zeros(4, 2, 4))  # noqa: E731
 
-    mixer = patch_nemotron_attn(monkeypatch, native)()
-    run_packed_forward(mixer)
+    def native(*args, **kwargs):
+        used.append("native")
+        return torch.zeros(4, 2, 4)
+
+    mixer = _patch_nemotron_attn(monkeypatch, native)()
+    _run_packed_forward(mixer)
 
     assert used == ["native"]
     assert mixer.dense_calls == 0
@@ -515,12 +524,18 @@ def test_nemotron_attention_prefers_the_hub_varlen_kernel_when_bound(monkeypatch
     from miles.backends.fsdp_utils.models.nemotron_h import HUB_VARLEN_ATTR
 
     used = []
-    native = lambda *a, **kw: (used.append("native") or torch.zeros(4, 2, 4))  # noqa: E731
-    from_hub = lambda *a, **kw: (used.append("hub") or torch.zeros(4, 2, 4))  # noqa: E731
 
-    mixer = patch_nemotron_attn(monkeypatch, native)()
+    def native(*args, **kwargs):
+        used.append("native")
+        return torch.zeros(4, 2, 4)
+
+    def from_hub(*args, **kwargs):
+        used.append("hub")
+        return torch.zeros(4, 2, 4)
+
+    mixer = _patch_nemotron_attn(monkeypatch, native)()
     setattr(mixer, HUB_VARLEN_ATTR, from_hub)
-    run_packed_forward(mixer)
+    _run_packed_forward(mixer)
 
     assert used == ["hub"]
     assert mixer.dense_calls == 0
@@ -528,7 +543,7 @@ def test_nemotron_attention_prefers_the_hub_varlen_kernel_when_bound(monkeypatch
 
 def test_nemotron_attention_falls_back_to_dense_when_no_varlen_kernel_exists(monkeypatch):
     """Pre-existing behaviour, unchanged: no wheel and no hub binding means the dense forward."""
-    mixer = patch_nemotron_attn(monkeypatch, None)()
-    run_packed_forward(mixer)
+    mixer = _patch_nemotron_attn(monkeypatch, None)()
+    _run_packed_forward(mixer)
 
     assert mixer.dense_calls == 1
