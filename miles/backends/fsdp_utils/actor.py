@@ -131,8 +131,8 @@ class FSDPTrainRayActor(TrainRayActor):
         apply_class_patches(self.hf_config, self.args)
         apply_packing(None, self.hf_config, "config")
 
-        # Collective: warm the HF kernel cache once (rank 0 downloads, the rest read it) so the
-        # per-model bind below is a cache hit on every rank. No-op unless --kernel-backend hub.
+        # Collective: local leaders warm the cache, then every rank agrees on each slot's
+        # build or fallback before either model is bound. No-op unless --kernel-backend hub.
         prefetch_hub_module_kernels(self.args)
 
         # backend-level true-on-policy setup (batch-invariant ops)

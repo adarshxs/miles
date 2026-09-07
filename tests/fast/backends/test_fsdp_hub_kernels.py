@@ -22,11 +22,7 @@ from miles.backends.fsdp_utils.arguments import validate_kernel_backend_args
 from miles.backends.fsdp_utils.kernels import hub
 from miles.backends.fsdp_utils.kernels.hub import HubKernelSpec, hub_kernels_enabled, load_module_kernels, resolve_slot
 from miles.backends.fsdp_utils.kernels.module_patches import apply_hub_module_kernels
-from miles.backends.fsdp_utils.kernels.presets import (
-    SLOT_CAUSAL_CONV1D,
-    SLOT_FLASH_ATTN_VARLEN,
-    SLOT_GATED_DELTA_RULE,
-)
+from miles.backends.fsdp_utils.kernels.presets import SLOT_CAUSAL_CONV1D, SLOT_FLASH_ATTN_VARLEN, SLOT_GATED_DELTA_RULE
 
 
 def _make_args(**overrides) -> Namespace:
@@ -45,8 +41,10 @@ def _make_args(**overrides) -> Namespace:
 def clear_kernel_cache():
     """The resolved-module cache is process-global by design; don't leak it between tests."""
     hub._RESOLVED.clear()
+    hub._SLOT_FAILURES.clear()
     yield
     hub._RESOLVED.clear()
+    hub._SLOT_FAILURES.clear()
 
 
 def _stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=None):
@@ -56,6 +54,8 @@ def _stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=
     resolve and another 404, which is how the per-slot independence is exercised.
     """
 
+    loaded = []
+
     def get_kernel(repo_id, revision=None, version=None, user_agent=None):
         if calls is not None:
             calls.append((repo_id, revision, version))
@@ -64,11 +64,21 @@ def _stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=
         if modules is not None:
             if repo_id not in modules:
                 raise FileNotFoundError(f"no stub build for {repo_id}")
-            return modules[repo_id]
-        return module
+            result = modules[repo_id]
+        else:
+            result = module
+        loaded.append(
+            types.SimpleNamespace(
+                module=result,
+                repo_info=types.SimpleNamespace(repo_id=repo_id, revision=revision or f"commit-v{version}"),
+                metadata=types.SimpleNamespace(id=f"build:{repo_id}"),
+            )
+        )
+        return result
 
     fake = types.ModuleType("kernels")
     fake.get_kernel = get_kernel
+    fake.get_loaded_kernels = lambda: loaded
     monkeypatch.setitem(sys.modules, "kernels", fake)
 
 
@@ -172,7 +182,9 @@ def test_default_mapping_pins_the_expected_repos():
 
 def _custom_mapping(args):
     return {
-        SLOT_CAUSAL_CONV1D: HubKernelSpec(repo_id="me/my-conv1d", revision="main", functions=("causal_conv1d_fn",))
+        SLOT_CAUSAL_CONV1D: HubKernelSpec(
+            repo_id="me/my-conv1d", revision="main", functions=("causal_conv1d_fn", "causal_conv1d_update")
+        )
     }
 
 
@@ -547,3 +559,74 @@ def test_nemotron_attention_falls_back_to_dense_when_no_varlen_kernel_exists(mon
     _run_packed_forward(mixer)
 
     assert mixer.dense_calls == 1
+
+
+def _incomplete_mapping(args):
+    return {args.test_slot: HubKernelSpec(repo_id="me/custom", version=1, functions=("causal_conv1d_fn",))}
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("slot", [SLOT_CAUSAL_CONV1D, SLOT_GATED_DELTA_RULE, SLOT_FLASH_ATTN_VARLEN])
+def test_incomplete_custom_slot_is_rejected_before_binding(monkeypatch, strict, slot):
+    calls = []
+    _stub_kernels(monkeypatch, modules=_all_hub_modules(), calls=calls)
+    model = _build_gdn_model()
+    model.blocks = nn.ModuleList([FakeAttnBlock()])
+    args = _make_args(kernel_mapping_path=f"{__name__}._incomplete_mapping", kernel_strict=strict, test_slot=slot)
+
+    with pytest.raises(ValueError, match="must declare all required functions"):
+        apply_hub_module_kernels(model, args)
+
+    assert calls == []
+    for layer in model.layers:
+        assert layer.causal_conv1d_fn is None
+        assert layer.chunk_gated_delta_rule is _torch_chunk_stand_in
+    assert not hasattr(model.blocks[0].mixer, "_hub_flash_attn_varlen_func")
+
+
+def test_unknown_custom_slot_is_rejected():
+    args = _make_args(kernel_mapping_path=f"{__name__}._incomplete_mapping", test_slot="causal_conv1d_typo")
+    with pytest.raises(ValueError, match="unknown kernel mapping slot"):
+        load_module_kernels(args)
+
+
+def test_complete_custom_mapping_binds_policy_and_reference_without_changing_weights(monkeypatch):
+    conv, update = lambda **kwargs: None, lambda **kwargs: None
+    calls = []
+    _stub_kernels(monkeypatch, module=_kernel_module(causal_conv1d_fn=conv, causal_conv1d_update=update), calls=calls)
+    args = _make_args(kernel_mapping_path=f"{__name__}._custom_mapping")
+    hub.prefetch_hub_module_kernels(args)
+
+    for _ in range(2):
+        model = _build_gdn_model()
+        model.proj = nn.Linear(4, 4)
+        before = {key: value.clone() for key, value in model.state_dict().items()}
+        assert apply_hub_module_kernels(model, args) == {"gated_deltanet": 2}
+        for layer in model.layers:
+            assert layer.causal_conv1d_fn is conv
+            assert layer.causal_conv1d_update is update
+            assert layer.chunk_gated_delta_rule is _torch_chunk_stand_in
+        assert model.state_dict().keys() == before.keys()
+        for key, expected in before.items():
+            torch.testing.assert_close(model.state_dict()[key], expected, rtol=0, atol=0)
+    assert calls == [("me/my-conv1d", "main", None)]
+
+
+def test_cached_failure_cannot_bypass_strict_mode(monkeypatch):
+    _stub_kernels(monkeypatch, raises=FileNotFoundError("missing"))
+    assert resolve_slot(_make_args(), SLOT_CAUSAL_CONV1D) is None
+    with pytest.raises(RuntimeError, match="--kernel-strict"):
+        resolve_slot(_make_args(kernel_strict=True), SLOT_CAUSAL_CONV1D)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_prefetch_rejects_kernels_without_hub_provenance(monkeypatch, strict):
+    _stub_kernels(monkeypatch, modules=_all_hub_modules())
+    sys.modules["kernels"].get_loaded_kernels = lambda: []
+    args = _make_args(kernel_strict=strict)
+    if strict:
+        with pytest.raises(RuntimeError, match="cannot establish Hub provenance"):
+            hub.prefetch_hub_module_kernels(args)
+    else:
+        hub.prefetch_hub_module_kernels(args)
+        assert apply_hub_module_kernels(_build_gdn_model(), args) == {}

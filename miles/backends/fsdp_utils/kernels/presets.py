@@ -49,6 +49,14 @@ FLASH_ATTN2 = HubKernelSpec(
 )
 
 
+# Custom mappings may replace repos or omit entire slots, but a selected slot must be complete.
+REQUIRED_SLOT_FUNCTIONS = {
+    SLOT_GATED_DELTA_RULE: FLA.functions,
+    SLOT_CAUSAL_CONV1D: CAUSAL_CONV1D.functions,
+    SLOT_FLASH_ATTN_VARLEN: FLASH_ATTN2.functions,
+}
+
+
 def default_module_kernels(args) -> dict[str, HubKernelSpec]:
     """The mapping miles ships. Empty under the deterministic run modes, which own their numerics."""
     if getattr(args, "true_on_policy_mode", False) or getattr(args, "deterministic_mode", False):

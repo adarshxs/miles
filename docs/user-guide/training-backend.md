@@ -406,7 +406,16 @@ What miles ships, in `miles/backends/fsdp_utils/kernels/presets.py`:
 | `causal_conv1d` | `kernels-community/causal-conv1d` v1 | GatedDeltaNet's short causal convolution, same architectures |
 | `flash_attn_varlen` | `kernels-community/flash-attn2` v2 | The NemotronH attention mixer's varlen path |
 
-Slots resolve independently, so one unavailable repo costs you that kernel and nothing else.
+Slots resolve independently. Before either model is bound, all ranks agree on each slot's
+availability, repository/ref, and kernel build identity. If any rank cannot load a slot or the
+identities differ, every rank keeps its native implementation for that slot. `--kernel-strict`
+turns that collective fallback into an initialization error on every rank.
+
+Custom mappings may omit entire slots, but each included slot must declare all the functions
+listed by `REQUIRED_SLOT_FUNCTIONS` in `presets.py`. Unknown slots and incomplete declarations
+are configuration errors, regardless of `--kernel-strict`; they are rejected before binding.
+Use repositories from trusted Hub kernel publishers. Local kernel overrides are unsupported
+because their Hub provenance cannot be verified across ranks.
 
 These are **module-level** kernels: `kernels.get_kernel()` returns a module and miles rebinds the
 free functions HF modeling code already looks up per forward. Nothing rebinds an `nn.Module.forward`,
@@ -426,8 +435,9 @@ packed document, and each one fails differently when its wheel is missing:
 - no `flash_attn` — the NemotronH attention patch returns the unpatched dense forward.
 
 In all three the per-document reset stops happening, nothing raises, and the only symptom is a wider
-train/rollout logprob gap. Serving the kernels from the Hub removes that failure mode without a
-wheel build.
+train/rollout logprob gap. Successfully loading the Hub kernels restores those boundary resets without a wheel build.
+Use `--kernel-strict` when those native wheels are absent: a non-strict fallback does not
+make a native implementation that ignores boundaries safe for packed training.
 
 </Note>
 
@@ -435,22 +445,16 @@ Hub kernels are rejected together with `--true-on-policy-mode` and `--determinis
 modes require the training kernel to match SGLang's build exactly, and that equivalence has not been
 established per kernel yet.
 
-For clusters whose compute nodes have no egress, pin and pre-download at image build time:
+This loader requires access to Hub metadata even when the kernel binaries are already cached.
+It does **not** consume `kernels.lock`, and `kernels lock . && kernels download .` does not make
+`--kernel-backend hub` work under `HF_HUB_OFFLINE=1`. Offline provisioning remains a follow-up
+in [RFC #2207](https://github.com/radixark/miles/issues/2207).
 
-```toml
-# pyproject.toml
-[tool.kernels.dependencies]
-"kernels-community/fla" = 1
-"kernels-community/causal-conv1d" = 1
-"kernels-community/flash-attn2" = 2
-```
-
-```dockerfile
-RUN kernels lock . && kernels download .
-```
-
-`kernels.lock` records a commit SHA plus a per-variant SHA-256, so every rank loads a byte-identical
-kernel and the run works under `HF_HUB_OFFLINE=1`.
+For repeatable online runs, provide a custom mapping with `HubKernelSpec(revision="<commit SHA>",
+version=None, ...)` for each selected repository, retaining the slot's required functions. Major
+versions such as `version=1` follow moving `v1` branches. The collective check ensures agreement
+within a run; immutable revisions also pin the source across runs. A revision pin still requires
+online metadata access with this loader.
 
 <Tip>
 

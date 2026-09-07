@@ -66,6 +66,9 @@ class HubKernelSpec:
 # per model would just re-pay the Hub round trip to fail the same way.
 _RESOLVED: dict[tuple[str, int | None, str | None], ModuleType | None] = {}
 
+# Collective decisions are per slot: two slots may share a repo but require different functions.
+_SLOT_FAILURES: dict[tuple[str, HubKernelSpec], str] = {}
+
 
 def hub_kernels_enabled(args) -> bool:
     return getattr(args, "kernel_backend", "native") == "hub"
@@ -91,12 +94,21 @@ def load_module_kernels(args) -> dict[str, HubKernelSpec]:
 
         provider = default_module_kernels
 
+    from miles.backends.fsdp_utils.kernels.presets import REQUIRED_SLOT_FUNCTIONS
+
     mapping = provider(args) or {}
     for slot, spec in mapping.items():
         if not isinstance(spec, HubKernelSpec):
             raise TypeError(
                 f"kernel mapping slot {slot!r} must be a HubKernelSpec, got {type(spec).__name__}; "
                 f"see miles/backends/fsdp_utils/kernels/presets.py"
+            )
+        if slot not in REQUIRED_SLOT_FUNCTIONS:
+            raise ValueError(f"unknown kernel mapping slot {slot!r}; expected one of {tuple(REQUIRED_SLOT_FUNCTIONS)}")
+        missing = set(REQUIRED_SLOT_FUNCTIONS[slot]) - set(spec.functions)
+        if missing:
+            raise ValueError(
+                f"kernel mapping slot {slot!r} must declare all required functions; missing {sorted(missing)}"
             )
     return mapping
 
@@ -112,6 +124,8 @@ def _import_hub_kernel(spec: HubKernelSpec) -> ModuleType:
 def _resolve_module(spec: HubKernelSpec, *, strict: bool) -> ModuleType | None:
     key = (spec.repo_id, spec.version, spec.revision)
     if key in _RESOLVED:
+        if strict and _RESOLVED[key] is None:
+            raise RuntimeError(f"--kernel-strict: hub kernel {spec.describe()} previously failed to resolve")
         return _RESOLVED[key]
 
     try:
@@ -147,67 +161,143 @@ def resolve_slot(args, slot: str) -> dict[str, Callable] | None:
         return None
 
     strict = bool(getattr(args, "kernel_strict", False))
+    failure = _SLOT_FAILURES.get((slot, spec))
+    if failure is not None:
+        if strict:
+            raise RuntimeError(f"--kernel-strict: {failure}")
+        return None
+
     module = _resolve_module(spec, strict=strict)
     if module is None:
         return None
 
-    functions: dict[str, Callable] = {}
-    for name in spec.functions:
-        fn = getattr(module, name, None)
-        if not callable(fn):
-            message = f"hub kernel {spec.describe()} does not expose a callable {name!r} (slot {slot!r})"
-            if strict:
-                raise RuntimeError(f"--kernel-strict: {message}")
-            logger.warning("[fsdp hub kernels] %s; keeping the native kernel", message)
-            return None
-        functions[name] = fn
+    try:
+        functions = _get_functions(module, spec)
+    except ValueError as exc:
+        if strict:
+            raise RuntimeError(f"--kernel-strict: {exc} (slot {slot!r})") from exc
+        logger.warning("[fsdp hub kernels] %s; keeping the native kernel", exc)
+        return None
 
     logger.info("[fsdp hub kernels] slot %r -> %s (%s)", slot, spec.describe(), ", ".join(spec.functions))
     return functions
 
 
-def prefetch_hub_module_kernels(args) -> None:
-    """Warm the HF cache for every mapped repo, one downloader per node first.
+def _get_functions(module: ModuleType, spec: HubKernelSpec) -> dict[str, Callable]:
+    functions = {name: getattr(module, name, None) for name in spec.functions}
+    for name, fn in functions.items():
+        if not callable(fn):
+            raise ValueError(f"hub kernel {spec.describe()} does not expose a callable {name!r}")
+    return functions
 
-    Collective: call it from every rank at the same point. ``huggingface_hub`` is safe under
-    concurrent downloads, but letting local rank 0 fetch and the rest read the cache avoids every
-    rank on the node racing on the same files. Downloading here rather than at first use also keeps
-    ``resolve_slot`` barrier-free, so the memoized second call (the ref model) cannot deadlock
-    against the first.
+
+def prefetch_hub_module_kernels(args) -> None:
+    """Collectively prepare kernels before either model is bound.
+
+    Every rank participates, including ranks with an empty or invalid mapping. Local leaders
+    download first; failures are collected before any rank raises. Each slot must expose its
+    functions and have the same repo/revision/build identity everywhere, or every rank falls
+    back (non-strict) / raises (strict). Per-model resolution then uses these cached decisions.
     """
-    mapping = load_module_kernels(args)
-    if not mapping:
+    if not hub_kernels_enabled(args):
         return
 
     strict = bool(getattr(args, "kernel_strict", False))
-    specs = list(dict.fromkeys(mapping.values()))
+    mapping = _collect_mapping(args, strict=strict)
+    if not mapping:
+        return
 
+    _SLOT_FAILURES.clear()
+    specs = list(dict.fromkeys(mapping.values()))
     for leader_turn in (True, False):
         if leader_turn == _is_download_leader():
             for spec in specs:
-                _resolve_module(spec, strict=strict)
+                # Strict errors must wait until the other ranks have reached the collective.
+                _resolve_module(spec, strict=False)
         _barrier()
+
+    outcomes = _all_gather_object({slot: _slot_status(spec) for slot, spec in mapping.items()})
+    for slot, spec in mapping.items():
+        failures = [f"rank {rank}: {status[slot][1]}" for rank, status in enumerate(outcomes) if status[slot][1]]
+        identities = [status[slot][0] for status in outcomes]
+        if not failures and any(identity != identities[0] for identity in identities[1:]):
+            failures = [f"repo/revision/build differs across ranks: {identities}"]
+        if failures:
+            message = f"slot {slot!r} ({spec.describe()}): {'; '.join(failures)}"
+            _SLOT_FAILURES[(slot, spec)] = message
+            logger.warning("[fsdp hub kernels] %s; keeping the native kernel on every rank", message)
+        else:
+            logger.info("[fsdp hub kernels] slot %r agreed across all ranks: %s", slot, identities[0])
+
+    if strict and _SLOT_FAILURES:
+        raise RuntimeError("--kernel-strict: " + "; ".join(_SLOT_FAILURES.values()))
+
+
+def _collect_mapping(args, *, strict: bool) -> dict[str, HubKernelSpec]:
+    mapping, error = {}, None
+    try:
+        mapping = load_module_kernels(args)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    configs = _all_gather_object((mapping, strict, error))
+    errors = [f"rank {rank}: {config[2]}" for rank, config in enumerate(configs) if config[2]]
+    if errors:
+        raise ValueError("invalid hub kernel mapping: " + "; ".join(errors))
+    if any(config[:2] != configs[0][:2] for config in configs[1:]):
+        raise ValueError("hub kernel mapping and --kernel-strict must match across all ranks")
+    return mapping
+
+
+def _slot_status(spec: HubKernelSpec) -> tuple[tuple[str, str, str] | None, str | None]:
+    try:
+        module = _resolve_module(spec, strict=True)
+        _get_functions(module, spec)
+        # Lazy optional dependency; the public registry identifies the module actually loaded,
+        # including moving refs and version-specific builds, rather than just the requested pin.
+        from kernels import get_loaded_kernels
+
+        for loaded in get_loaded_kernels():
+            if loaded.module is module and loaded.repo_info is not None:
+                return (loaded.repo_info.repo_id, loaded.repo_info.revision, loaded.metadata.id), None
+        raise ValueError(f"cannot establish Hub provenance for {spec.describe()} (local overrides are unsupported)")
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def _is_download_leader() -> bool:
     """One leader per node: local rank 0 covers a node-local cache and a shared one alike."""
+    return int(os.environ.get("LOCAL_RANK", 0)) == 0 if _distributed() else True
+
+
+def _distributed() -> bool:
     import torch.distributed as dist
 
-    if not (dist.is_available() and dist.is_initialized()):
-        return True
-    return int(os.environ.get("LOCAL_RANK", 0)) == 0
+    return dist.is_available() and dist.is_initialized()
+
+
+def _collective_group():
+    # Optional outside the actor: standalone Gloo harnesses can use the default process group.
+    from miles.utils.distributed_utils import get_gloo_group
+
+    try:
+        return get_gloo_group()
+    except RuntimeError:
+        return None
+
+
+def _all_gather_object(value) -> list:
+    if not _distributed():
+        return [value]
+    import torch.distributed as dist
+
+    group = _collective_group()
+    values = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(values, value, group=group)
+    return values
 
 
 def _barrier() -> None:
-    import torch.distributed as dist
+    if _distributed():
+        import torch.distributed as dist
 
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    try:
-        from miles.utils.distributed_utils import get_gloo_group
-
-        group = get_gloo_group()
-    except RuntimeError:
-        # No gloo side-channel in this job (single-process tests, standalone harnesses).
-        group = None
-    dist.barrier(group=group)
+        dist.barrier(group=_collective_group())
