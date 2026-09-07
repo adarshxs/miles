@@ -19,7 +19,7 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_policy_loss,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
-from miles.utils.misc import load_function
+from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
 
 
@@ -493,9 +493,9 @@ def sft_loss_function(
     log_probs = torch.cat(log_probs, dim=0)
     loss = -sum_of_sample_mean(log_probs)
 
-    # make sure the gradient could backprop correctly.
+    # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     return (
         loss,
