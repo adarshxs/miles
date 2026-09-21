@@ -41,6 +41,7 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
         for scenario in _SCENARIOS:
             hub._RESOLVED.clear()
             hub._SLOT_FAILURES.clear()
+            hub._AGREED_MAPPING = None
             args = _make_args(kernel_strict=strict)
             modules = _all_hub_modules()
             with pytest.MonkeyPatch.context() as patch:

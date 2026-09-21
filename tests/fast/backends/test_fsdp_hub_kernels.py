@@ -22,7 +22,12 @@ from miles.backends.fsdp_utils.arguments import validate_kernel_backend_args
 from miles.backends.fsdp_utils.kernels import hub
 from miles.backends.fsdp_utils.kernels.hub import HubKernelSpec, hub_kernels_enabled, load_module_kernels, resolve_slot
 from miles.backends.fsdp_utils.kernels.module_patches import apply_hub_module_kernels
-from miles.backends.fsdp_utils.kernels.presets import SLOT_CAUSAL_CONV1D, SLOT_FLASH_ATTN_VARLEN, SLOT_GATED_DELTA_RULE
+from miles.backends.fsdp_utils.kernels.presets import (
+    CAUSAL_CONV1D,
+    SLOT_CAUSAL_CONV1D,
+    SLOT_FLASH_ATTN_VARLEN,
+    SLOT_GATED_DELTA_RULE,
+)
 
 
 def _make_args(**overrides) -> Namespace:
@@ -42,9 +47,11 @@ def clear_kernel_cache():
     """The resolved-module cache is process-global by design; don't leak it between tests."""
     hub._RESOLVED.clear()
     hub._SLOT_FAILURES.clear()
+    hub._AGREED_MAPPING = None
     yield
     hub._RESOLVED.clear()
     hub._SLOT_FAILURES.clear()
+    hub._AGREED_MAPPING = None
 
 
 def _stub_kernels(monkeypatch, *, module=None, modules=None, raises=None, calls=None):
@@ -294,6 +301,32 @@ def test_prefetch_warms_every_mapped_repo_once(monkeypatch):
         "kernels-community/fla",
         "kernels-community/flash-attn2",
     ]
+
+
+_drifting_mapping_calls = []
+
+
+def _drifting_mapping(args):
+    """A provider whose answer changes between calls, e.g. one that reads mutable state."""
+    _drifting_mapping_calls.append(None)
+    revision = "agreed-rev" if len(_drifting_mapping_calls) == 1 else "other-rev"
+    return {
+        SLOT_CAUSAL_CONV1D: HubKernelSpec(CAUSAL_CONV1D.repo_id, revision=revision, functions=CAUSAL_CONV1D.functions)
+    }
+
+
+def test_binding_uses_the_mapping_agreed_in_prefetch(monkeypatch):
+    calls = []
+    _drifting_mapping_calls.clear()
+    _stub_kernels(monkeypatch, modules=_all_hub_modules(), calls=calls)
+    args = _make_args(kernel_mapping_path=f"{__name__}._drifting_mapping")
+
+    hub.prefetch_hub_module_kernels(args)
+    assert resolve_slot(args, SLOT_CAUSAL_CONV1D) is not None
+
+    # The provider ran once, and the only revision ever requested is the one the ranks agreed on.
+    assert len(_drifting_mapping_calls) == 1
+    assert {revision for _, revision, _ in calls} == {"agreed-rev"}
 
 
 # ------------------------------------------------------------------------------ GatedDeltaNet

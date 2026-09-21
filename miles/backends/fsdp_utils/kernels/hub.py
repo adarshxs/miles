@@ -69,6 +69,10 @@ _RESOLVED: dict[tuple[str, int | None, str | None], ModuleType | None] = {}
 # Collective decisions are per slot: two slots may share a repo but require different functions.
 _SLOT_FAILURES: dict[tuple[str, HubKernelSpec], str] = {}
 
+# The mapping every rank agreed on in prefetch. Binding reads this instead of re-invoking the
+# provider, so a non-deterministic --kernel-mapping-path cannot bind a spec no rank agreed on.
+_AGREED_MAPPING: dict[str, HubKernelSpec] | None = None
+
 
 def hub_kernels_enabled(args) -> bool:
     return getattr(args, "kernel_backend", "native") == "hub"
@@ -156,7 +160,8 @@ def resolve_slot(args, slot: str) -> dict[str, Callable] | None:
     mapping, repo unresolvable, function missing from the build -- so callers only branch once.
     Under ``--kernel-strict`` the last two raise instead.
     """
-    spec = load_module_kernels(args).get(slot)
+    mapping = _AGREED_MAPPING if _AGREED_MAPPING is not None else load_module_kernels(args)
+    spec = mapping.get(slot)
     if spec is None:
         return None
 
@@ -202,8 +207,11 @@ def prefetch_hub_module_kernels(args) -> None:
     if not hub_kernels_enabled(args):
         return
 
+    global _AGREED_MAPPING
+
     strict = bool(getattr(args, "kernel_strict", False))
     mapping = _collect_mapping(args, strict=strict)
+    _AGREED_MAPPING = mapping
     if not mapping:
         return
 
