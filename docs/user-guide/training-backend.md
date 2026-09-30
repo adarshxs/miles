@@ -398,7 +398,9 @@ image rebuild to change a kernel.**
 | `--kernel-mapping-path` | Dotted path to your own `(args) -> dict[str, HubKernelSpec]`, replacing the shipped mapping entirely. |
 | `--kernel-strict` | Raise when a repo or a function will not resolve, instead of falling back to the native kernel. |
 
-What miles ships, in `miles/backends/fsdp_utils/kernels/presets.py`:
+What miles ships, in `miles/backends/fsdp_utils/plugins/hf_kernels/presets.py` (the whole
+feature lives in that plugin package; the main FSDP path only calls `HubKernels.prepare()` once
+and `bind()` per model):
 
 | Slot | Repo | Feeds |
 |---|---|---|
@@ -412,15 +414,15 @@ identities differ, every rank keeps its native implementation for that slot. `--
 turns that collective fallback into an initialization error on every rank.
 
 Custom mappings may omit entire slots, but each included slot must declare all the functions
-listed by `REQUIRED_SLOT_FUNCTIONS` in `presets.py`. Unknown slots and incomplete declarations
-are configuration errors, regardless of `--kernel-strict`; they are rejected before binding.
-Use repositories from trusted Hub kernel publishers. Local kernel overrides are unsupported
-because their Hub provenance cannot be verified across ranks.
+listed by `REQUIRED_SLOT_FUNCTIONS` in `presets.py`; unknown slots and incomplete declarations
+are rejected before anything downloads, regardless of `--kernel-strict`. Use repositories from
+trusted Hub kernel publishers. Local kernel overrides are unsupported because their Hub
+provenance cannot be verified across ranks.
 
 These are **module-level** kernels: `kernels.get_kernel()` returns a module and miles rebinds the
 free functions HF modeling code already looks up per forward. Nothing rebinds an `nn.Module.forward`,
-so `state_dict`, `_no_split_modules` and the DTensor gather in `update_weight_utils.py` are all
-untouched — which is why the binding runs before `apply_fsdp2` and the ref model takes the same call.
+so `state_dict`, `_no_split_modules` and the DTensor gather are untouched — which is why the binding
+runs before `apply_fsdp2` and the ref model takes the same call.
 
 <Note>
 

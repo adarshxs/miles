@@ -1,4 +1,4 @@
-"""Two-rank Gloo regressions for Hub preparation; no CUDA devices or Hub requests."""
+"""Two-rank Gloo regressions for `HubKernels.prepare`; no CUDA devices or Hub requests."""
 
 import os
 import subprocess
@@ -27,9 +27,8 @@ _SCENARIOS = (
 def _worker(rank: int, rendezvous: str, strict: bool) -> None:
     from tests.fast.backends.test_fsdp_hub_kernels import _all_hub_modules, _build_gdn_model, _make_args, _stub_kernels
 
-    from miles.backends.fsdp_utils.kernels import hub
-    from miles.backends.fsdp_utils.kernels.module_patches import apply_hub_module_kernels
-    from miles.backends.fsdp_utils.kernels.presets import SLOT_CAUSAL_CONV1D, SLOT_GATED_DELTA_RULE
+    from miles.backends.fsdp_utils.plugins.hf_kernels import loader
+    from miles.backends.fsdp_utils.plugins.hf_kernels.presets import SLOT_CAUSAL_CONV1D, SLOT_GATED_DELTA_RULE
     from miles.utils.distributed_utils import init_gloo_group
 
     os.environ["LOCAL_RANK"] = str(rank)
@@ -39,16 +38,13 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
     init_gloo_group()
     try:
         for scenario in _SCENARIOS:
-            hub._RESOLVED.clear()
-            hub._SLOT_FAILURES.clear()
-            hub._AGREED_MAPPING = None
             args = _make_args(kernel_strict=strict)
             modules = _all_hub_modules()
             with pytest.MonkeyPatch.context() as patch:
                 _stub_kernels(patch, modules=modules)
                 fake = sys.modules["kernels"]
                 original_get = fake.get_kernel
-                mapping = hub.load_module_kernels(args)
+                mapping = loader.load_mapping(args)
                 error = None
 
                 def get_kernel(repo_id, *, scenario=scenario, original_get=original_get, fake=fake, **kwargs):
@@ -76,17 +72,18 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
                         def invalid_mapping(args):
                             raise ValueError("simulated invalid slot declaration")
 
-                        patch.setattr(hub, "load_module_kernels", invalid_mapping)
+                        patch.setattr(loader, "load_mapping", invalid_mapping)
                     elif scenario in ("different_mapping", "empty_mapping"):
                         altered = (
                             {} if scenario == "empty_mapping" else {SLOT_CAUSAL_CONV1D: mapping[SLOT_CAUSAL_CONV1D]}
                         )
-                        patch.setattr(hub, "load_module_kernels", lambda args, altered=altered: altered)
+                        patch.setattr(loader, "load_mapping", lambda args, altered=altered: altered)
                     elif scenario == "different_strict":
                         args.kernel_strict = not strict
 
+                hub = None
                 try:
-                    hub.prefetch_hub_module_kernels(args)
+                    hub = loader.HubKernels.prepare(args)
                 except (ValueError, RuntimeError) as exc:
                     error = str(exc)
 
@@ -102,9 +99,9 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
                     # Repeated binding exercises the policy and reference model path after consensus.
                     for _ in range(2):
                         model = _build_gdn_model()
-                        assert apply_hub_module_kernels(model, args) == {"gated_deltanet": 2}
-                        assert hub.resolve_slot(args, SLOT_CAUSAL_CONV1D) is not None
-                        chosen = hub.resolve_slot(args, SLOT_GATED_DELTA_RULE)
+                        assert hub.bind(model) == {"gated_deltanet": 2}
+                        assert hub.resolve_slot(SLOT_CAUSAL_CONV1D) is not None
+                        chosen = hub.resolve_slot(SLOT_GATED_DELTA_RULE)
                         assert (chosen is not None) == (scenario == "success")
                         if scenario == "success":
                             assert (
